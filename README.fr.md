@@ -29,7 +29,7 @@ docker run --rm --privileged --pid=host \
   debian-host-audit:0.1.0
 ```
 
-`summary.md` s'affiche sur la sortie standard. Tout est écrit dans `reports/<hostname>_<horodatage UTC>/`. Les fichiers appartiennent au propriétaire de `reports/` et ne sont lisibles que par lui.
+`summary.md` s'affiche sur la sortie standard. Tout est écrit dans `reports/<hostname>_<horodatage UTC>/`, sous l'identité du propriétaire de `reports/` (pas en root), et lisible par lui seul.
 
 **Pour un agent**, demander le JSON sur la sortie standard (les journaux partent sur la sortie d'erreur) :
 
@@ -61,7 +61,7 @@ Options
   --version
 ```
 
-Codes de sortie : `0` rapport produit · `1` erreur préalable (option ou montage manquant) · `2` seuil `--fail-on` atteint.
+Codes de sortie : `0` rapport produit · `1` erreur (option ou montage manquant, option invalide, synthèse en échec) · `2` rapport produit et seuil `--fail-on` atteint. Les options sont validées avant le début de l'audit.
 
 ## Le rapport
 
@@ -72,7 +72,7 @@ Codes de sortie : `0` rapport produit · `1` erreur préalable (option ou montag
 | `run` | hostname, OS, horodatage, durée, versions des outils, étapes |
 | `coverage[]` | une entrée par contrôle : `ok` / `partial` / `failed` / `skipped`, avec la raison et la durée |
 | `coverage_complete` | passe à `false` dès qu'un contrôle n'est pas `ok`. **À lire en premier.** |
-| `witness` | la preuve que Lynis a audité l'hôte et non le conteneur (voir plus bas) |
+| `witness` | la preuve que Lynis a audité l'hôte et non le conteneur (voir plus bas). Le collecteur subit le même contrôle. |
 | `host` | indice de durcissement Lynis, décompte docker-bench, faits collectés (écoutes, groupes, réglages sshd, noyaux…) |
 | `counts` | nombre de constats par sévérité |
 | `findings[]` | `{id, source, severity, category, title, evidence, remediation, references}`, triés par sévérité |
@@ -92,11 +92,13 @@ L'échelle de sévérité est `critical > high > medium > low > info`. Correspon
 Le conteneur ne fait que **livrer** les outils. Il ne s'audite pas lui-même.
 
 1. **Lynis, docker-bench et le collecteur maison s'exécutent dans les espaces de noms de l'hôte** (`nsenter -t 1 -m -u -i -n -p`), avec les binaires de l'hôte. Un Lynis lancé dans un conteneur ordinaire audite le conteneur, et son rapport paraît propre.
-2. Ils s'exécutent depuis le système de fichiers de l'image et y écrivent leurs rapports, en passant par `/proc/<pid du conteneur>/root`. **Rien n'est écrit sur le disque de l'hôte audité.** Une seule exception : Lynis crée dans le `/tmp` de l'hôte des fichiers temporaires de courte durée, qu'il supprime.
-3. **Trivy** ne parcourt jamais le système de fichiers de l'hôte. Il scanne une copie minimale de `os-release` et du `status` de dpkg, ce qui prend quelques secondes, même sur un hôte qui porte des téraoctets de données. Les images sont lues via le socket Docker.
-4. **Contrôle témoin.** L'image est elle aussi en Debian 13, donc « l'OS est Debian 13 » ne prouve rien. La synthèse compare le hostname vu par Lynis à celui de l'hôte, et le nombre de paquets compté par Lynis à un plancher que l'image ne peut pas atteindre. Si l'un des deux échoue, les constats Lynis sont écartés et sa couverture passe à `failed`.
+2. Ils s'exécutent depuis le système de fichiers de l'image et écrivent dans un **dossier de travail situé dans le système de fichiers propre au conteneur** (`/var/lib/dha-work`), qu'ils atteignent depuis l'espace de noms de l'hôte via `/proc/<pid du conteneur>/root`. Aucun utilisateur de l'hôte n'a accès à ce dossier : rien de ce qu'il y planterait (un lien symbolique, par exemple) ne peut rediriger ces écritures root vers l'hôte. **Rien n'est écrit sur le disque de l'hôte audité.**
+   - Lynis est corrigé (3 lignes, [`build/patch-lynis.sh`](build/patch-lynis.sh)) pour que ses fichiers temporaires et son fichier PID suivent `LYNIS_TMPDIR` dans ce dossier de travail, au lieu du `/tmp` et du `/var/run` de l'hôte. Le build échoue si ces lignes changent en amont.
+3. **Trivy** ne parcourt jamais le système de fichiers de l'hôte. Il scanne une copie minimale de `os-release` et du `status` de dpkg, lue via l'espace de noms de l'hôte, ce qui prend quelques secondes, même sur un hôte qui porte des téraoctets de données. Les images sont lues via le socket Docker. Trivy sort en 0 avec un résultat vide quand il ne reconnaît pas l'OS : la synthèse exige donc un OS détecté et un nombre de paquets cohérent avec dpkg. Sinon, le contrôle est `failed`, et non propre.
+4. **Contrôles témoins.** L'image est elle aussi en Debian 13, donc « l'OS est Debian 13 » ne prouve rien. La synthèse compare le hostname vu par Lynis (forme courte) à celui de l'hôte lu via le montage `/host`, qui ne dépend pas des espaces de noms traversés. Elle compare aussi le nombre de paquets compté par Lynis à un plancher que l'image ne peut pas atteindre. Si l'un des deux échoue, les constats Lynis sont écartés et sa couverture passe à `failed`. Le hostname vu par le collecteur subit le même contrôle.
+5. **Livraison.** À la fin, le dossier de travail est copié dans `/reports/<nom>`, avec l'uid et le gid du propriétaire de `/reports` et toutes les capacités retirées, dans un dossier qui ne doit pas déjà exister. Il n'y a aucun `chown` récursif en root.
 
-Les vérifications préalables refusent de lancer l'audit sans `-v /:/host:ro`, `--pid=host` ou `--privileged`, plutôt que de rendre un rapport sur le mauvais système.
+Les vérifications préalables refusent de lancer l'audit sans `-v /:/host:ro`, `--pid=host` ou `--privileged`, plutôt que de rendre un rapport sur le mauvais système. Le contrôle de `--pid=host` compare les espaces de noms de montage : `--init` ne le trompe pas.
 
 ## Auditer plusieurs VM
 
@@ -105,7 +107,7 @@ Les vérifications préalables refusent de lancer l'audit sans `-v /:/host:ro`, 
 scripts/audit-remote.sh --ship-image vm1 vm2 admin@vm3 -- all --max-images 20
 ```
 
-Les fichiers bruts restent sur chaque hôte, dans `~/host-audit-reports/`. Ajouter `--sudo` si l'utilisateur SSH n'est pas dans le groupe `docker`.
+Les fichiers bruts restent sur chaque hôte, dans `~/host-audit-reports/`. Ajouter `--sudo` si l'utilisateur SSH n'est pas dans le groupe `docker` ; il faut alors un sudo sans mot de passe, puisque ssh tourne sans tty. Un hôte en échec n'arrête jamais les autres. Code de sortie : `0` tous les rapports produits, `2` tous produits et au moins un a atteint `--fail-on`, `1` au moins un hôte en échec.
 
 ## Sécurité
 
@@ -116,12 +118,25 @@ Les fichiers bruts restent sur chaque hôte, dans `~/host-audit-reports/`. Ajout
     --certificate-identity-regexp '^https://github.com/aquasecurity/trivy/' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com trivy_<v>_Linux-64bit.tar.gz
   ```
-- **Les rapports sont sensibles.** Ils décrivent précisément comment attaquer l'hôte. Ils sont écrits lisibles par leur seul propriétaire (`0700`/`0600`) ; ne pas les laisser traîner dans un endroit public.
+- **Les rapports sont sensibles.** Ils décrivent précisément comment attaquer l'hôte. Ils sont créés lisibles par leur seul propriétaire dès le départ (`umask 077`), et restent dans le conteneur jusqu'à la fin du passage. Ne pas les laisser traîner dans un endroit public.
 - **Lecture seule par construction.** Ni `apt update`, ni installation de paquet, ni changement de configuration. Les mises à jour en attente sont lues dans le cache apt local, et un constat prévient quand ce cache a plus de 7 jours.
+
+## Autres distributions
+
+Construit et testé sur Debian 13 (trixie). Ailleurs, chaque partie se dégrade de façon explicite, sans produire de faux résultat :
+
+| Partie | Ubuntu / famille Debian | RHEL, Rocky, Alma, Fedora, Alpine, Arch… |
+|---|---|---|
+| Lynis | ✅ | ✅ (Lynis est multi-distribution) |
+| docker-bench | ✅ | ✅ |
+| Trivy, images | ✅ | ✅ |
+| Trivy, paquets de l'hôte | ✅ | ⏭️ `skipped` (pas de dpkg), visible dans `coverage` |
+| Contrôles maison | ✅ | ⚠️ partiel : les contrôles fondés sur apt (mises à jour en attente, unattended-upgrades) ne sont pas évalués, le reste tourne |
+
+Un contrôle qui ne peut pas tourner sur un hôte est absent des constats. Il n'est jamais signalé comme un problème.
 
 ## Limites
 
-- **Conçu pour Debian 13 (trixie).** Les autres versions de Debian fonctionnent en grande partie, avec un avertissement. Les autres distributions ne sont pas prises en charge.
 - **docker-bench-security 1.6.1 est sa dernière version publiée (2023).** Il implémente le référentiel CIS Docker 1.6, et certains contrôles sont en retard sur les versions récentes de Docker Engine.
 - **Un seul démon Docker** est audité, celui du socket par défaut. Docker rootless et `userns-remap` n'ont pas été testés.
 - **Trivy télécharge sa base de vulnérabilités** (~80 Mo) à chaque passage. Pour un hôte isolé, construire avec `--build-arg EMBED_TRIVY_DB=1` et passer `--offline`. La base embarquée vieillit, il faut donc reconstruire régulièrement.
@@ -131,15 +146,15 @@ Les fichiers bruts restent sur chaque hôte, dans `~/host-audit-reports/`. Ajout
 
 ```bash
 python3 -m unittest discover -s tests          # bibliothèque standard uniquement
-shellcheck -S warning bin/audit lib/collect-host.sh scripts/audit-remote.sh
+shellcheck -S warning bin/audit lib/collect-host.sh scripts/audit-remote.sh build/patch-lynis.sh
 ```
 
 Pour monter un composant de version, changer `*_VERSION` et `*_SHA256` dans le `Dockerfile` dans le même commit.
 
 ## Licence
 
-MIT, voir [LICENSE](LICENSE). L'image redistribue sans modification :
-- Lynis, sous **GPL-3.0** : son code source, ce sont les scripts shell eux-mêmes, dans `/opt/lynis` ;
-- docker-bench-security et Trivy, sous **Apache-2.0**.
+MIT, voir [LICENSE](LICENSE). L'image redistribue :
+- Lynis, sous **GPL-3.0**, **modifié** : 3 lignes, pour que les fichiers temporaires et PID suivent `LYNIS_TMPDIR`. La modification est [`build/patch-lynis.sh`](build/patch-lynis.sh), et le code modifié, ce sont les scripts shell eux-mêmes, dans `/opt/lynis` ;
+- docker-bench-security et Trivy, sous **Apache-2.0**, sans modification.
 
 Leurs textes de licence se trouvent dans `/usr/share/doc/third-party/` à l'intérieur de l'image.

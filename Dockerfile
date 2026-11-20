@@ -19,10 +19,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl jq python3 \
  && rm -rf /var/lib/apt/lists/*
 
+COPY build/patch-lynis.sh /tmp/patch-lynis.sh
+
 RUN set -eu; cd /tmp; \
     curl -fsSL -o lynis.tgz "https://github.com/CISOfy/lynis/archive/refs/tags/${LYNIS_VERSION}.tar.gz"; \
     echo "${LYNIS_SHA256}  lynis.tgz" | sha256sum -c -; \
     mkdir -p /opt/lynis && tar xzf lynis.tgz -C /opt/lynis --strip-components=1; \
+    # GPL-3.0 modification notice: temp/PID files honour LYNIS_TMPDIR (see build/patch-lynis.sh)
+    sh /tmp/patch-lynis.sh /opt/lynis; rm /tmp/patch-lynis.sh; \
     curl -fsSL -o bench.tgz "https://github.com/docker/docker-bench-security/archive/refs/tags/v${DOCKER_BENCH_VERSION}.tar.gz"; \
     echo "${DOCKER_BENCH_SHA256}  bench.tgz" | sha256sum -c -; \
     mkdir -p /opt/docker-bench && tar xzf bench.tgz -C /opt/docker-bench --strip-components=1; \

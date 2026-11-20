@@ -263,7 +263,7 @@ def custom_findings(host: Path) -> tuple[list[dict], dict]:
     # Docker published ports on all interfaces
     for line in (txt("docker-published") or "").splitlines():
         name, _, ports = line.partition("\t")
-        public = re.findall(r"(?:0\.0\.0\.0|\[::\]|:::):(\d+)->", ports)
+        public = re.findall(r"(?:0\.0\.0\.0|\[::\]|::):(\d+)->", ports)
         if public:
             out.append(finding(f"custom:docker-published:{name}", "custom", "medium", "docker",
                                f"Container {name} publishes ports on all interfaces",
@@ -271,8 +271,9 @@ def custom_findings(host: Path) -> tuple[list[dict], dict]:
                                "Bind to 127.0.0.1 (`127.0.0.1:PORT:PORT`) unless the port must be public. "
                                "Docker-published ports are NOT filtered by the INPUT chain."))
 
-    # Updates
-    upg = [l for l in (txt("apt-upgradable") or "").splitlines() if "/" in l and "[upgradable" in l]
+    # Updates — Debian family only; an absent check is "not evaluated", not a finding
+    apt_list = txt("apt-upgradable")
+    upg = [l for l in (apt_list or "").splitlines() if "/" in l and "[upgradable" in l]
     security = [l.split("/")[0] for l in upg if "-security" in l]
     facts["upgradable_packages"] = len(upg)
     facts["upgradable_security_packages"] = len(security)
@@ -296,9 +297,9 @@ def custom_findings(host: Path) -> tuple[list[dict], dict]:
                                    "", "Run `apt-get update` (or enable apt-daily.timer)."))
         except ValueError:
             pass
-    unattended = txt("unattended") or ""
-    facts["unattended_upgrades"] = "install ok installed" in unattended
-    if "install ok installed" not in unattended:
+    unattended = txt("unattended")
+    facts["unattended_upgrades"] = None if unattended is None else "install ok installed" in unattended
+    if unattended is not None and "install ok installed" not in unattended:
         out.append(finding("custom:no-unattended-upgrades", "custom", "medium", "updates",
                            "unattended-upgrades is not installed",
                            "", "apt-get install unattended-upgrades && dpkg-reconfigure -plow unattended-upgrades",
@@ -337,7 +338,9 @@ def custom_findings(host: Path) -> tuple[list[dict], dict]:
 
 
 def _version_key(v: str):
-    return [int(x) if x.isdigit() else x for x in re.split(r"[.\-+~]", v)]
+    # (0, n) for numbers, (1, s) for words: tuples always compare, so mixed
+    # names such as "6.12.48+deb13-amd64" and "6.12.48-1-amd64" never raise.
+    return [(0, int(x), "") if x.isdigit() else (1, 0, x) for x in re.split(r"[.\-+~]", v)]
 
 
 # ------------------------------------------------------------------ Trivy
@@ -353,6 +356,8 @@ def trivy_summary(path: Path, target_label: str, kind: str) -> tuple[dict | None
     counts = Counter()
     fixable_counts = Counter()
     fixable = []
+    packages = sum(len(res.get("Packages") or []) for res in data.get("Results") or [])
+    os_meta = (data.get("Metadata") or {}).get("OS") or {}
     for res in data.get("Results") or []:
         for v in res.get("Vulnerabilities") or []:
             sev = (v.get("Severity") or "UNKNOWN").lower()
@@ -370,6 +375,8 @@ def trivy_summary(path: Path, target_label: str, kind: str) -> tuple[dict | None
     unfixed = {sev: counts[sev] - fixable_counts[sev] for sev in ("critical", "high")}
     summary = {
         "target": target_label, "kind": kind, "unfixed_critical_high": unfixed,
+        "os": " ".join(filter(None, [os_meta.get("Family"), os_meta.get("Name")])) or None,
+        "packages": packages,
         "counts": dict(counts), "fixable_counts": dict(fixable_counts),
         "fixable_critical_high": sorted(fixable, key=lambda x: (RANK.get(x["severity"], 9), x["package"] or "")),
     }
@@ -399,19 +406,50 @@ def trivy_summary(path: Path, target_label: str, kind: str) -> tuple[dict | None
     return summary, findings
 
 
+def trivy_host_problem(summary: dict | None, dpkg_count: str | None) -> str | None:
+    """Trivy exits 0 with zero results when it does not recognise the OS: a
+    host would then look CVE-free. Require a detected OS and a package count
+    in line with the host's dpkg database."""
+    if summary is None:
+        return "unreadable trivy-host.json"
+    if not summary["os"]:
+        return "Trivy did not detect the host OS — results would be empty, not clean"
+    try:
+        expected = int((dpkg_count or "").strip())
+    except ValueError:
+        expected = None
+    if summary["packages"] == 0:
+        return "Trivy saw 0 packages"
+    if expected and summary["packages"] < expected * 0.9:
+        return f"Trivy saw {summary['packages']} packages, dpkg lists {expected}"
+    return None
+
+
 # ------------------------------------------------------------------ witness
+
+def short(name: str | None) -> str:
+    return (name or "").strip().split(".")[0].lower()
+
+
+def reference_hostname(run: dict) -> str:
+    # Read through the -v /:/host bind mount: independent of nsenter, so it
+    # still names the host if the namespaces we entered were the wrong ones.
+    return short(run.get("hostname_mount") or run.get("hostname"))
+
 
 def witness(report: dict | None, run: dict, host_dir: Path) -> dict:
     """Prove Lynis audited the HOST, not the container. Both are Debian 13,
-    so the OS name proves nothing: compare hostname and package count."""
+    so the OS name proves nothing: compare hostname and package count.
+    Lynis records the short hostname, so short names are compared."""
     if report is None:
         return {"status": "not-applicable"}
     sc = report["scalars"]
     lynis_host = sc.get("hostname", "")
     lynis_pkgs = sc.get("installed_packages", "")
+    ref = reference_hostname(run)
     checks = {
-        "hostname": {"lynis": lynis_host, "host": run.get("hostname"),
-                     "ok": bool(lynis_host) and lynis_host == run.get("hostname")},
+        "hostname": {"lynis": lynis_host, "host": ref,
+                     "ok": bool(lynis_host) and short(lynis_host) == ref},
     }
     try:
         n = int(lynis_pkgs)
@@ -449,9 +487,15 @@ def build(out_dir: Path) -> dict:
         findings += lynis_findings(report)
 
     if cov.get("custom", {}).get("status") == "ok":
-        f, facts = custom_findings(raw / "host")
-        findings += f
-        host_info["facts"] = facts
+        seen = short(read(raw / "host" / "hostname.txt"))
+        if seen != reference_hostname(run):
+            cov["custom"].update(status="failed",
+                                 reason=f"witness check failed: collector saw hostname '{seen}', host is "
+                                        f"'{reference_hostname(run)}' — findings discarded")
+        else:
+            f, facts = custom_findings(raw / "host")
+            findings += f
+            host_info["facts"] = facts
 
     if cov.get("docker-bench", {}).get("status") == "ok":
         results, parser = parse_docker_bench(read(raw / "docker-bench.log.json"), read(raw / "docker-bench.log"))
@@ -467,9 +511,11 @@ def build(out_dir: Path) -> dict:
     vulns = []
     if cov.get("trivy-host", {}).get("status") == "ok":
         s, f = trivy_summary(raw / "trivy-host.json", "host packages", "host")
-        if s is None:
-            cov["trivy-host"].update(status="failed", reason="unreadable trivy-host.json")
+        problem = trivy_host_problem(s, read(raw / "dpkg-package-count.txt"))
+        if problem:
+            cov["trivy-host"].update(status="failed", reason=problem)
         else:
+            cov["trivy-host"]["reason"] = f"{s['packages']} packages, OS {s['os']}"
             vulns.append(s); findings += f
     index = raw / "images" / "index.tsv"
     if index.exists():
@@ -568,6 +614,8 @@ def render_md(s: dict) -> str:
 
 
 def check_threshold(severity: str, summary_path: Path) -> int:
+    """0 = below threshold, 2 = threshold reached, 1 = usage error."""
+    severity = severity.lower()
     if severity not in RANK:
         print(f"unknown severity {severity}", file=sys.stderr)
         return 1

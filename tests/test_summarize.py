@@ -47,18 +47,20 @@ TRIVY = {
 
 
 def make_report(tmp: Path, *, hostname="web-01", lynis=LYNIS_REPORT, host_files=None,
-                coverage=None, bench=None, trivy=None) -> Path:
+                coverage=None, bench=None, trivy=None, hostname_mount=None) -> Path:
     raw = tmp / "raw"
     (raw / "coverage").mkdir(parents=True)
     (raw / "host").mkdir()
     (raw / "images").mkdir()
-    (raw / "run.json").write_text(json.dumps({"hostname": hostname, "os": "Debian 13"}))
+    (raw / "run.json").write_text(json.dumps({"hostname": hostname, "os": "Debian 13",
+                                              "hostname_mount": hostname_mount or hostname}))
     cov = coverage or {"lynis": "ok", "custom": "ok"}
     for check, status in cov.items():
         (raw / "coverage" / f"{check}.json").write_text(json.dumps(
             {"check": check, "status": status, "reason": "", "duration_s": 1}))
     (raw / "lynis-report.dat").write_text(lynis)
-    for name, content in (host_files or {}).items():
+    files = {"hostname": hostname + "\n", **(host_files or {})}
+    for name, content in files.items():
         (raw / "host" / f"{name}.txt").write_text(content)
         (raw / "host" / f"{name}.rc").write_text("0\n")
     if bench is not None:
@@ -92,6 +94,23 @@ class LynisTests(unittest.TestCase):
         lynis_cov = next(c for c in s["coverage"] if c["check"] == "lynis")
         self.assertEqual(lynis_cov["status"], "failed")
         self.assertFalse(s["coverage_complete"])
+
+
+    def test_witness_compares_short_hostnames(self):
+        # Lynis records `hostname -s`; /etc/hostname may hold an FQDN.
+        with tempfile.TemporaryDirectory() as d:
+            s = S.build(make_report(Path(d), hostname_mount="web-01.example.org"))
+        self.assertEqual(s["witness"]["status"], "ok")
+        self.assertTrue([f for f in s["findings"] if f["source"] == "lynis"])
+
+    def test_collector_witness_failure_discards_custom_findings(self):
+        # e.g. --init without --pid=host: nsenter -t 1 entered the container.
+        with tempfile.TemporaryDirectory() as d:
+            s = S.build(make_report(Path(d), host_files={"hostname": "3f2a1b\n",
+                                                         "groups-priv": "docker:x:999:alice\n"}))
+        custom = next(c for c in s["coverage"] if c["check"] == "custom")
+        self.assertEqual(custom["status"], "failed")
+        self.assertFalse([f for f in s["findings"] if f["source"] == "custom"])
 
 
 class DockerBenchTests(unittest.TestCase):
@@ -154,9 +173,22 @@ class CustomCheckTests(unittest.TestCase):
         self.assertEqual(sev["custom:no-unattended-upgrades"], "medium")
 
     def test_missing_collector_output_is_not_a_finding(self):
-        # A command that did not run must not be read as "empty = clean" or "empty = bad".
-        f, _ = self.findings({"unattended": "install ok installed\n"})
-        self.assertNotIn("custom:ssh-password-auth", {x["id"] for x in f})
+        # A command that did not run (no sshd, no apt: non-Debian host) must not
+        # be read as "empty = clean" or "empty = bad".
+        f, facts = self.findings({})
+        ids = {x["id"] for x in f}
+        self.assertNotIn("custom:ssh-password-auth", ids)
+        self.assertNotIn("custom:no-unattended-upgrades", ids)
+        self.assertIsNone(facts["unattended_upgrades"])
+
+    def test_ipv6_any_published_port(self):
+        f, _ = self.findings({"docker-published": "web\t:::8080->80/tcp\n"})
+        self.assertIn("custom:docker-published:web", {x["id"] for x in f})
+
+    def test_mixed_kernel_names_do_not_crash(self):
+        f, _ = self.findings({"kernel-running": "6.12.48-1-amd64\n",
+                              "kernels-installed": "6.12.48+deb13-amd64\n6.12.48-1-amd64\n"})
+        self.assertIsInstance(f, list)
 
 
 class TrivyTests(unittest.TestCase):
@@ -168,6 +200,21 @@ class TrivyTests(unittest.TestCase):
         self.assertEqual([v["id"] for v in summary["fixable_critical_high"]], ["CVE-1"])
         self.assertEqual(summary["unfixed_critical_high"], {"critical": 0, "high": 1})
         self.assertEqual({f["severity"] for f in findings}, {"critical", "info"})
+
+
+    def test_trivy_host_without_os_or_packages_is_a_failure(self):
+        base = {"os": "debian 13.7", "packages": 700}
+        self.assertIsNone(S.trivy_host_problem(base, "766\n"))
+        self.assertIn("did not detect", S.trivy_host_problem({**base, "os": None}, "766"))
+        self.assertIn("0 packages", S.trivy_host_problem({**base, "packages": 0}, "766"))
+        self.assertIn("dpkg lists", S.trivy_host_problem({**base, "packages": 100}, "766"))
+
+    def test_trivy_host_coverage_downgraded_when_os_missing(self):
+        no_os = {"Results": [{"Target": "x", "Packages": [{"Name": "a"}]}]}
+        with tempfile.TemporaryDirectory() as d:
+            s = S.build(make_report(Path(d), coverage={"trivy-host": "ok"}, trivy=no_os))
+        cov = next(c for c in s["coverage"] if c["check"] == "trivy-host")
+        self.assertEqual(cov["status"], "failed")
 
 
 class CoverageAndThresholdTests(unittest.TestCase):
@@ -184,6 +231,8 @@ class CoverageAndThresholdTests(unittest.TestCase):
             self.assertTrue((out / "summary.md").read_text().startswith("# Security audit — web-01"))
             self.assertEqual(S.check_threshold("high", out / "summary.json"), 2)
             self.assertEqual(S.check_threshold("critical", out / "summary.json"), 0)
+            self.assertEqual(S.check_threshold("HIGH", out / "summary.json"), 2)
+            self.assertEqual(S.check_threshold("crit", out / "summary.json"), 1)
 
 
 if __name__ == "__main__":

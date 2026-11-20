@@ -3,17 +3,26 @@
 #
 # Design: the container only DELIVERS the tools. Lynis, docker-bench-security
 # and the custom collector run inside the host namespaces (nsenter -t 1), with
-# the host's own binaries, and write their output back into the container via
-# /proc/<our pid>/root — so the audited host's disk is never written to.
+# the host's own binaries. They write into a work directory that lives in the
+# CONTAINER's own filesystem, reached from the host namespace through
+# /proc/<our pid>/root. No host user can reach that directory, so nothing they
+# plant can redirect those root writes onto the host.
+# The finished report is copied to /reports at the very end, from the container
+# side, with the identity of whoever owns /reports — never as root over a tree
+# someone else controls.
 # Trivy runs in the container against a minimal copy of the host's dpkg state,
 # so it never walks the host filesystem.
 
 set -uo pipefail
+umask 077
 
 VERSION=$(cat /opt/dha/VERSION 2>/dev/null || echo dev)
 HOST_ROOT=${HOST_ROOT:-/host}
 REPORTS_DIR=${REPORTS_DIR:-/reports}
 SELF_ROOT="/proc/$$/root"
+WORK=/var/lib/dha-work          # container-private, see preflight
+RAW="$WORK/raw"
+HOST_RAW="$SELF_ROOT$RAW"       # the same directory, as seen from the host namespace
 DOCKER_SOCK=${DOCKER_SOCK:-}
 IMAGES_MODE=running
 MAX_IMAGES=0
@@ -21,6 +30,7 @@ STDOUT_FORMAT=md
 FAIL_ON=
 OFFLINE=0
 STEPS=()
+SEVERITIES="critical high medium low info"
 
 usage() {
     cat <<'EOF'
@@ -39,12 +49,12 @@ Options:
   --max-images N       scan at most N images (coverage is then reported as "partial")
   --docker-socket PATH Docker socket, as seen in the container (default: $HOST_ROOT/run/docker.sock)
   --json               print summary.json on stdout (default: summary.md). Logs go to stderr.
-  --fail-on SEVERITY   exit 2 if any finding is at or above SEVERITY (critical|high|medium|low)
+  --fail-on SEVERITY   exit 2 if any finding is at or above SEVERITY (critical|high|medium|low|info)
   --offline            never download the Trivy DB (requires an image built with EMBED_TRIVY_DB=1)
   --version            print versions and exit
   -h, --help           this help
 
-Exit codes: 0 report produced · 1 preflight error · 2 --fail-on threshold reached
+Exit codes: 0 report produced · 1 error · 2 --fail-on threshold reached (report produced)
 EOF
 }
 
@@ -58,7 +68,7 @@ while [ $# -gt 0 ]; do
         --max-images) MAX_IMAGES=${2:?}; shift ;;
         --docker-socket) DOCKER_SOCK=${2:?}; shift ;;
         --json) STDOUT_FORMAT=json ;;
-        --fail-on) FAIL_ON=${2:?}; shift ;;
+        --fail-on) FAIL_ON=$(printf '%s' "${2:?}" | tr '[:upper:]' '[:lower:]'); shift ;;
         --offline) OFFLINE=1 ;;
         --version)
             echo "debian-host-audit $VERSION (lynis $LYNIS_VERSION, docker-bench-security $DOCKER_BENCH_VERSION, trivy $TRIVY_VERSION)"
@@ -70,6 +80,10 @@ while [ $# -gt 0 ]; do
 done
 [ ${#STEPS[@]} -eq 0 ] && STEPS=(all)
 case "$IMAGES_MODE" in running|all|none) ;; *) die "--images must be running|all|none" ;; esac
+case "$MAX_IMAGES" in ''|*[!0-9]*) die "--max-images must be a non-negative integer" ;; esac
+if [ -n "$FAIL_ON" ] && ! printf '%s\n' $SEVERITIES | grep -qx -- "$FAIL_ON"; then
+    die "--fail-on must be one of: $SEVERITIES"
+fi
 DOCKER_SOCK=${DOCKER_SOCK:-$HOST_ROOT/run/docker.sock}
 
 want() {
@@ -80,25 +94,39 @@ want() {
 
 # ---------------------------------------------------------------- preflight
 [ -r "$HOST_ROOT/etc/os-release" ] || die "host root not mounted: add -v /:/host:ro"
-[ "$$" -ne 1 ] || die "not in the host PID namespace: add --pid=host"
+# PID 1 must be the HOST's init. Testing `$$ != 1` is not enough: with --init,
+# PID 1 is tini, inside our own namespaces. The host's PID 1 never shares our
+# mount namespace.
+if [ "$$" -eq 1 ] || [ "$(readlink /proc/1/ns/mnt 2>/dev/null)" = "$(readlink /proc/self/ns/mnt)" ]; then
+    die "not in the host PID namespace: add --pid=host"
+fi
 nsenter -t 1 -m -u -i -n -p -- true 2>/dev/null || die "cannot enter host namespaces: add --privileged"
 
-host_ns() {
+# The work directory must belong to the container's own root filesystem, not
+# to a volume a host user could reach.
+mkdir -p "$WORK"
+[ "$(findmnt -n -o TARGET -T "$WORK")" = / ] || die "$WORK must not be a mount point or under a volume"
+rm -rf "${WORK:?}"/*
+mkdir -p "$RAW/host" "$RAW/coverage" "$RAW/images" "$RAW/tmp"
+
+host_ns() {  # host_ns [NAME=VALUE...] command...
     nsenter -t 1 -m -u -i -n -p -- env -i \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         LC_ALL=C HOME=/root TERM=dumb "$@"
 }
 
-HOSTNAME_HOST=$(host_ns hostname 2>/dev/null || cat "$HOST_ROOT/etc/hostname")
-# shellcheck disable=SC1091
-OS_HOST=$(. "$HOST_ROOT/etc/os-release" 2>/dev/null; echo "${PRETTY_NAME:-unknown}")
-case "$OS_HOST" in *"Debian"*13*|*trixie*) ;; *) log "WARNING: built for Debian 13, host is '$OS_HOST' — results may be incomplete" ;; esac
+# Two independent views of the host's name: through the bind mount and through
+# the namespaces. The witness checks compare tool output against the first one.
+HOSTNAME_MOUNT=$(tr -d '[:space:]' <"$HOST_ROOT/etc/hostname" 2>/dev/null)
+HOSTNAME_NS=$(host_ns hostname 2>/dev/null)
+HOSTNAME_HOST=${HOSTNAME_MOUNT:-$HOSTNAME_NS}
+[ -n "$HOSTNAME_HOST" ] || die "cannot determine the host's hostname"
+OS_HOST=$(sed -n 's/^PRETTY_NAME=//p' "$HOST_ROOT/etc/os-release" 2>/dev/null | tr -d '"')
+OS_ID=$(sed -n 's/^ID=//p' "$HOST_ROOT/etc/os-release" 2>/dev/null | tr -d '"')
+case "$OS_HOST" in *"Debian"*13*|*trixie*) ;; *) log "WARNING: built for Debian 13, host is '${OS_HOST:-unknown}' — see README, 'Other distributions'" ;; esac
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-OUT="$REPORTS_DIR/${HOSTNAME_HOST}_${STAMP}"
-RAW="$OUT/raw"
-mkdir -p "$RAW/host" "$RAW/coverage" "$RAW/images" || die "cannot create $OUT"
-mountpoint -q "$REPORTS_DIR" 2>/dev/null || log "NOTE: $REPORTS_DIR is not a volume — raw files are lost when the container exits (stdout still carries the summary)"
+OUT_NAME="${HOSTNAME_HOST}_${STAMP}"
 START_ALL=$(date +%s)
 
 # coverage <check> <ok|partial|failed|skipped> <reason> <start-epoch>
@@ -114,9 +142,12 @@ coverage() {
 step_lynis() {
     local t0; t0=$(date +%s)
     log "lynis: running system audit (1-3 min)"
-    host_ns sh -c 'cd "$1" && ./lynis audit system --no-colors --quick --auditor debian-host-audit \
-                     --logfile "$2" --report-file "$3"' _ \
-        "$SELF_ROOT/opt/lynis" "$SELF_ROOT$RAW/lynis.log" "$SELF_ROOT$RAW/lynis-report.dat" \
+    # LYNIS_TMPDIR: honoured by the patched Lynis (build/patch-lynis.sh) for its
+    # temp files and PID file, which would otherwise land in the host's /tmp
+    # and /var/run.
+    host_ns LYNIS_TMPDIR="$HOST_RAW/tmp" sh -c 'cd "$1" && ./lynis audit system --no-colors --quick \
+                     --auditor debian-host-audit --logfile "$2" --report-file "$3"' _ \
+        "$SELF_ROOT/opt/lynis" "$HOST_RAW/lynis.log" "$HOST_RAW/lynis-report.dat" \
         >"$RAW/lynis.txt" 2>&1
     if [ -s "$RAW/lynis-report.dat" ]; then
         coverage lynis ok "" "$t0"
@@ -128,7 +159,7 @@ step_lynis() {
 step_collect() {
     local t0; t0=$(date +%s)
     log "custom: collecting host state"
-    if host_ns sh "$SELF_ROOT/opt/dha/lib/collect-host.sh" "$SELF_ROOT$RAW/host" >"$RAW/host/_collector.txt" 2>&1; then
+    if host_ns sh "$SELF_ROOT/opt/dha/lib/collect-host.sh" "$HOST_RAW/host" >"$RAW/host/_collector.txt" 2>&1; then
         coverage custom ok "" "$t0"
     else
         coverage custom failed "collector error, see raw/host/_collector.txt" "$t0"
@@ -143,7 +174,7 @@ step_docker_bench() {
     fi
     log "docker-bench: running CIS Docker benchmark (1-5 min)"
     host_ns sh -c 'cd "$1" && bash ./docker-bench-security.sh -b -l "$2"' _ \
-        "$SELF_ROOT/opt/docker-bench" "$SELF_ROOT$RAW/docker-bench.log" \
+        "$SELF_ROOT/opt/docker-bench" "$HOST_RAW/docker-bench.log" \
         >"$RAW/docker-bench.txt" 2>&1
     if [ -s "$RAW/docker-bench.log" ]; then
         coverage docker-bench ok "" "$t0"
@@ -156,35 +187,32 @@ trivy_db_flags() {
     if [ "$OFFLINE" = 1 ]; then echo "--skip-db-update --skip-java-db-update --offline-scan"; fi
 }
 
-# Copy a host file, resolving symlinks against HOST_ROOT (an absolute symlink
-# must not silently resolve inside the container, which is ALSO Debian 13).
-host_copy() {
-    local p=$1 dst=$2 t
-    for _ in 1 2 3 4 5 6 7 8; do
-        [ -L "$HOST_ROOT$p" ] || break
-        t=$(readlink "$HOST_ROOT$p")
-        case "$t" in /*) p=$t ;; *) p="$(dirname "$p")/$t" ;; esac
-    done
-    [ -f "$HOST_ROOT$p" ] && mkdir -p "$(dirname "$dst")" && cat "$HOST_ROOT$p" >"$dst"
-}
-
 step_vulns() {
     local t0; t0=$(date +%s)
-    local osroot=/tmp/osroot
-    rm -rf "$osroot"; mkdir -p "$osroot"
-    host_copy /etc/os-release      "$osroot/etc/os-release"
-    host_copy /etc/debian_version  "$osroot/etc/debian_version"
-    if ! host_copy /var/lib/dpkg/status "$osroot/var/lib/dpkg/status"; then
-        coverage trivy-host failed "no dpkg status on host" "$t0"; return
+    local osroot="$WORK/osroot"
+    if ! host_ns sh -c 'command -v dpkg-query >/dev/null'; then
+        coverage trivy-host skipped "host has no dpkg (${OS_ID:-unknown} host): only Debian-family package databases are scanned" "$t0"
+        return
     fi
+    mkdir -p "$osroot/etc" "$osroot/var/lib/dpkg"
+    # Read through the host namespace: symlinks (on any path component) resolve
+    # on the host, never inside this container — which is also Debian 13.
+    if ! host_ns cat /etc/os-release >"$osroot/etc/os-release" \
+       || ! host_ns cat /var/lib/dpkg/status >"$osroot/var/lib/dpkg/status"; then
+        coverage trivy-host failed "cannot read /etc/os-release or /var/lib/dpkg/status on the host" "$t0"
+        return
+    fi
+    host_ns cat /etc/debian_version >"$osroot/etc/debian_version" 2>/dev/null || rm -f "$osroot/etc/debian_version"
     log "trivy: scanning host Debian packages"
+    # --list-all-pkgs lets summarize.py prove Trivy actually saw the packages.
     # shellcheck disable=SC2046
-    if trivy rootfs --quiet --scanners vuln --pkg-types os $(trivy_db_flags) \
+    if trivy rootfs --quiet --scanners vuln --pkg-types os --list-all-pkgs $(trivy_db_flags) \
             --format json --output "$RAW/trivy-host.json" "$osroot" >"$RAW/trivy-host.txt" 2>&1; then
         coverage trivy-host ok "" "$t0"
     else
         coverage trivy-host failed "trivy error (DB download?), see raw/trivy-host.txt" "$t0"
     fi
+    grep -c '^Package: ' "$osroot/var/lib/dpkg/status" >"$RAW/dpkg-package-count.txt" 2>/dev/null || true
 }
 
 docker_api() { curl -fsS --unix-socket "$DOCKER_SOCK" "http://localhost/v1.41$1"; }
@@ -209,7 +237,7 @@ step_images() {
         [ -n "$id" ] || continue
         [ "$MAX_IMAGES" -gt 0 ] && [ "$n" -ge "$MAX_IMAGES" ] && break
         ref=$(docker_api "/images/$id/json" | jq -r '(.RepoTags // [])[0] // .Id')
-        safe=$(printf '%s' "${id#sha256:}" | cut -c1-12)
+        safe=$(printf '%s' "${id#sha256:}" | tr -cd 'a-f0-9' | cut -c1-12)
         printf '%s\t%s\t%s\n' "$safe" "$ref" "$containers" >>"$RAW/images/index.tsv"
         n=$((n + 1))
         log "trivy: image $n/$total — $ref"
@@ -230,6 +258,32 @@ step_images() {
     fi
 }
 
+# Copy the work directory to $REPORTS_DIR/$OUT_NAME as the owner of
+# $REPORTS_DIR, with every privilege dropped. Whatever that owner planted in
+# their own directory, these writes can only reach what they could write anyway.
+OUT=
+deliver() {
+    rm -rf "${RAW:?}/tmp"
+    if ! mountpoint -q "$REPORTS_DIR" 2>/dev/null; then
+        log "NOTE: $REPORTS_DIR is not a volume — raw files are lost when the container exits (stdout still carries the summary)"
+        return 0
+    fi
+    local uid gid
+    uid=$(stat -c %u "$REPORTS_DIR") gid=$(stat -c %g "$REPORTS_DIR")
+    as_owner() { setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=-all --no-new-privs "$@"; }
+    # No -p: refuse to reuse a directory that already exists.
+    if ! as_owner mkdir -m 0700 -- "$REPORTS_DIR/$OUT_NAME"; then
+        log "ERROR: cannot create $REPORTS_DIR/$OUT_NAME as uid $uid (exists, or not writable by its owner)"
+        return 1
+    fi
+    if tar -C "$WORK" --exclude=./osroot -cf - . | as_owner tar -C "$REPORTS_DIR/$OUT_NAME" -xf - --no-same-owner --no-same-permissions; then
+        OUT="$REPORTS_DIR/$OUT_NAME"
+    else
+        log "ERROR: copying the report to $REPORTS_DIR/$OUT_NAME failed"
+        return 1
+    fi
+}
+
 want host   && { step_lynis; step_collect; }
 want docker && step_docker_bench
 want vulns  && step_vulns
@@ -237,23 +291,29 @@ want images && step_images
 
 # ---------------------------------------------------------------- report
 jq -n --arg tool_version "$VERSION" --arg lynis "$LYNIS_VERSION" --arg bench "$DOCKER_BENCH_VERSION" \
-      --arg trivy "$TRIVY_VERSION" --arg hostname "$HOSTNAME_HOST" --arg os "$OS_HOST" \
-      --arg stamp "$STAMP" --argjson duration "$(( $(date +%s) - START_ALL ))" \
+      --arg trivy "$TRIVY_VERSION" --arg hostname "$HOSTNAME_HOST" \
+      --arg hostname_mount "$HOSTNAME_MOUNT" --arg hostname_ns "$HOSTNAME_NS" --arg os "$OS_HOST" \
+      --arg os_id "$OS_ID" --arg stamp "$STAMP" --argjson duration "$(( $(date +%s) - START_ALL ))" \
       --arg steps "${STEPS[*]}" --arg images_mode "$IMAGES_MODE" \
       '{tool_version:$tool_version, components:{lynis:$lynis, "docker-bench-security":$bench, trivy:$trivy},
-        hostname:$hostname, os:$os, audited_at:$stamp, duration_s:$duration,
+        hostname:$hostname, hostname_mount:$hostname_mount, hostname_ns:$hostname_ns,
+        os:$os, os_id:$os_id, audited_at:$stamp, duration_s:$duration,
         steps:($steps|split(" ")), images_mode:$images_mode}' >"$RAW/run.json"
 
-python3 /opt/dha/lib/summarize.py "$OUT" || die "summary generation failed (raw files kept in $OUT/raw)"
-# Hand the report to whoever owns the mounted reports directory. Owner-only:
-# a security posture report is sensitive.
-chown -R "$(stat -c %u:%g "$REPORTS_DIR")" "$OUT" 2>/dev/null || true
-chmod -R u+rwX,go-rwx "$OUT" 2>/dev/null || true
-log "report: $OUT/summary.md and $OUT/summary.json"
-
-if [ "$STDOUT_FORMAT" = json ]; then cat "$OUT/summary.json"; else cat "$OUT/summary.md"; fi
-
-if [ -n "$FAIL_ON" ]; then
-    python3 /opt/dha/lib/summarize.py --check-threshold "$FAIL_ON" "$OUT/summary.json" || exit 2
+if ! python3 /opt/dha/lib/summarize.py "$WORK"; then
+    log "ERROR: summary generation failed"
+    deliver && [ -n "$OUT" ] && log "raw files kept in $OUT/raw"
+    exit 1
 fi
-exit 0
+
+if [ "$STDOUT_FORMAT" = json ]; then cat "$WORK/summary.json"; else cat "$WORK/summary.md"; fi
+
+rc=0
+if [ -n "$FAIL_ON" ]; then
+    python3 /opt/dha/lib/summarize.py --check-threshold "$FAIL_ON" "$WORK/summary.json"
+    case $? in 0) ;; 2) rc=2 ;; *) log "ERROR: threshold check failed"; rc=1 ;; esac
+fi
+
+deliver || rc=1
+[ -n "$OUT" ] && log "report: $OUT/summary.md and $OUT/summary.json"
+exit $rc

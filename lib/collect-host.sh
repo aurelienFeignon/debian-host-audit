@@ -3,8 +3,8 @@
 # Read-only: every command below only reads state. Raw output only — all
 # interpretation happens in summarize.py, inside the container.
 #
-# Usage: collect-host.sh <output-dir>   (output-dir is reached through
-#        /proc/<container-pid>/root, so nothing is written to the host disk)
+# Usage: collect-host.sh <output-dir>   (a container-private directory reached
+#        through /proc/<container-pid>/root: nothing is written to the host disk)
 
 out=${1:?output directory required}
 mkdir -p "$out" || exit 1
@@ -39,9 +39,13 @@ if has sshd; then
 fi
 
 # Package state, from the local apt cache only (no `apt update`: read-only).
-run apt-upgradable  sh -c 'apt list --upgradable 2>/dev/null'
-run apt-lists-age   sh -c 'stat -c %Y /var/lib/apt/lists/* 2>/dev/null | sort -n | tail -1; date +%s'
-run unattended      sh -c 'dpkg-query -W -f="\${Status}\n" unattended-upgrades 2>/dev/null; systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null; cat /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null'
+# Debian family only: on other hosts these files are simply absent, and
+# summarize.py treats an absent check as "not evaluated", never as a finding.
+if has apt && has dpkg-query; then
+    run apt-upgradable  sh -c 'apt list --upgradable 2>/dev/null'
+    run apt-lists-age   sh -c 'stat -c %Y /var/lib/apt/lists/* 2>/dev/null | sort -n | tail -1; date +%s'
+    run unattended      sh -c 'dpkg-query -W -f="\${Status}\n" unattended-upgrades 2>/dev/null; systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null; cat /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null'
+fi
 
 # Firewall
 if has nft; then run nft-ruleset nft list ruleset; fi
