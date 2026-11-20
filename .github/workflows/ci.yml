@@ -1,0 +1,135 @@
+name: ci
+
+# Every push and PR: unit tests, shellcheck, image build, and a REAL audit of
+# the GitHub runner (an Ubuntu VM) with assertions on the witness and coverage.
+# Tags v*: the same, then the image is pushed to GHCR with a signed build
+# provenance attestation.
+#
+# Actions are pinned by commit SHA: this image runs as root on audited hosts,
+# so its build pipeline is part of the trust chain.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  IMAGE: ghcr.io/aurelienfeignon/debian-host-audit
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: shellcheck
+        run: shellcheck -S warning bin/audit lib/collect-host.sh scripts/audit-remote.sh build/patch-lynis.sh
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write       # push to GHCR (tags only)
+      id-token: write       # sign the provenance attestation (tags only)
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tag must match VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          v=$(cat VERSION)
+          [ "$TAG" = "v$v" ] || { echo "::error::tag $TAG does not match VERSION $v"; exit 1; }
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha
+
+      - name: Build (local)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: debian-host-audit:ci
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Audit the runner (integration test)
+        run: |
+          set -eu
+          docker run --rm debian-host-audit:ci --version
+          mkdir -p reports
+          rc=0
+          docker run --rm --privileged --pid=host -v /:/host:ro -v "$PWD/reports:/reports" \
+            debian-host-audit:ci all --images running --max-images 2 --json > summary.json || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::audit exited $rc"; exit 1; }
+          jq '{witness: .witness.status, coverage: [.coverage[] | {check, status, reason}], counts}' summary.json
+          for check in lynis custom docker-bench trivy-host; do
+            st=$(jq -r --arg c "$check" '.coverage[] | select(.check == $c) | .status' summary.json)
+            [ "$st" = ok ] || { echo "::error::$check is '$st', expected ok"; exit 1; }
+          done
+          [ "$(jq -r .witness.status summary.json)" = ok ] || { echo "::error::witness failed"; exit 1; }
+          # The report must have been delivered as the reports dir owner, owner-only.
+          d=$(find reports -mindepth 1 -maxdepth 1 -type d | head -1)
+          [ "$(stat -c %U "$d")" = "$(id -un)" ] || { echo "::error::report not owned by $(id -un)"; exit 1; }
+          [ "$(stat -c %a "$d")" = 700 ] || { echo "::error::report dir mode is not 700"; exit 1; }
+          # Nothing left in the host's /tmp or /run by Lynis.
+          ! sudo ls /tmp /run | grep -q '^lynis' || { echo "::error::Lynis files found on the host"; exit 1; }
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          sbom: true
+          provenance: mode=max
+
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

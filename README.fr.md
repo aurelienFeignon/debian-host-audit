@@ -20,13 +20,23 @@ Ces outils sont bons, mais chacun a son format de sortie et sa propre notion de 
 ## Démarrage rapide
 
 ```bash
-git clone <ce dépôt> && cd debian-host-audit
-docker build -t debian-host-audit:0.1.0 .
+docker pull ghcr.io/aurelienfeignon/debian-host-audit:0.1
+# vérifier qu'elle a été construite par la CI de ce dépôt, depuis un commit étiqueté
+gh attestation verify oci://ghcr.io/aurelienfeignon/debian-host-audit:0.1 --owner aurelienFeignon
 
 mkdir -p reports
 docker run --rm --privileged --pid=host \
   -v /:/host:ro -v "$PWD/reports:/reports" \
-  debian-host-audit:0.1.0
+  ghcr.io/aurelienfeignon/debian-host-audit:0.1
+```
+
+Étiquettes : `0.1.0` (exacte), `0.1` (dernier correctif), `latest`. Pour un outil qui tourne en root, mieux vaut épingler l'empreinte affichée par `docker pull` : `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Les images sont en linux/amd64, avec un SBOM et une attestation de provenance signée.
+
+Ou la construire soi-même :
+
+```bash
+git clone https://github.com/aurelienFeignon/debian-host-audit && cd debian-host-audit
+docker build -t debian-host-audit:0.1.0 .
 ```
 
 `summary.md` s'affiche sur la sortie standard. Tout est écrit dans `reports/<hostname>_<horodatage UTC>/`, sous l'identité du propriétaire de `reports/` (pas en root), et lisible par lui seul.
@@ -103,8 +113,11 @@ Les vérifications préalables refusent de lancer l'audit sans `-v /:/host:ro`, 
 ## Auditer plusieurs VM
 
 ```bash
-# copie l'image par SSH (sans registre), l'exécute, rapatrie <hôte>.json en local
-scripts/audit-remote.sh --ship-image vm1 vm2 admin@vm3 -- all --max-images 20
+# chaque hôte tire l'image de GHCR et l'exécute ; <hôte>.json est rapatrié en local
+IMAGE=ghcr.io/aurelienfeignon/debian-host-audit:0.1 scripts/audit-remote.sh vm1 vm2 admin@vm3 -- all --max-images 20
+
+# ou, avec une image construite en local et des hôtes sans accès au registre
+scripts/audit-remote.sh --ship-image vm1 vm2
 ```
 
 Les fichiers bruts restent sur chaque hôte, dans `~/host-audit-reports/`. Ajouter `--sudo` si l'utilisateur SSH n'est pas dans le groupe `docker` ; il faut alors un sudo sans mot de passe, puisque ssh tourne sans tty. Un hôte en échec n'arrête jamais les autres. Code de sortie : `0` tous les rapports produits, `2` tous produits et au moins un a atteint `--fail-on`, `1` au moins un hôte en échec.
@@ -150,6 +163,8 @@ shellcheck -S warning bin/audit lib/collect-host.sh scripts/audit-remote.sh buil
 ```
 
 Pour monter un composant de version, changer `*_VERSION` et `*_SHA256` dans le `Dockerfile` dans le même commit.
+
+La CI (`.github/workflows/ci.yml`) lance les tests unitaires et shellcheck, construit l'image, puis **audite le runner GitHub lui-même**. Elle échoue si le témoin, ou l'un des contrôles Lynis, maison, docker-bench ou trivy-host, n'est pas `ok`. Pour publier une version : monter `VERSION`, faire le commit, puis pousser l'étiquette correspondante (`git tag v0.1.1 && git push origin v0.1.1`). Si l'étiquette ne correspond pas à `VERSION`, la publication échoue.
 
 ## Licence
 
