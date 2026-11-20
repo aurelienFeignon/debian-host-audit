@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# debian-host-audit entrypoint. See README.md.
+#
+# Design: the container only DELIVERS the tools. Lynis, docker-bench-security
+# and the custom collector run inside the host namespaces (nsenter -t 1), with
+# the host's own binaries, and write their output back into the container via
+# /proc/<our pid>/root — so the audited host's disk is never written to.
+# Trivy runs in the container against a minimal copy of the host's dpkg state,
+# so it never walks the host filesystem.
+
+set -uo pipefail
+
+VERSION=$(cat /opt/dha/VERSION 2>/dev/null || echo dev)
+HOST_ROOT=${HOST_ROOT:-/host}
+REPORTS_DIR=${REPORTS_DIR:-/reports}
+SELF_ROOT="/proc/$$/root"
+DOCKER_SOCK=${DOCKER_SOCK:-}
+IMAGES_MODE=running
+MAX_IMAGES=0
+STDOUT_FORMAT=md
+FAIL_ON=
+OFFLINE=0
+STEPS=()
+
+usage() {
+    cat <<'EOF'
+Usage: docker run --rm --privileged --pid=host \
+         -v /:/host:ro -v "$PWD/reports:/reports" debian-host-audit [STEP...] [OPTIONS]
+
+Steps (default: all):
+  all       every step below
+  host      Lynis system audit + custom host checks (SSH, firewall, updates, accounts, ports)
+  docker    docker-bench-security (CIS Docker benchmark), skipped if Docker is absent
+  vulns     Trivy CVE scan of the host's Debian packages
+  images    Trivy CVE scan of container images (see --images)
+
+Options:
+  --images MODE        running (default: images of running containers) | all | none
+  --max-images N       scan at most N images (coverage is then reported as "partial")
+  --docker-socket PATH Docker socket, as seen in the container (default: $HOST_ROOT/run/docker.sock)
+  --json               print summary.json on stdout (default: summary.md). Logs go to stderr.
+  --fail-on SEVERITY   exit 2 if any finding is at or above SEVERITY (critical|high|medium|low)
+  --offline            never download the Trivy DB (requires an image built with EMBED_TRIVY_DB=1)
+  --version            print versions and exit
+  -h, --help           this help
+
+Exit codes: 0 report produced · 1 preflight error · 2 --fail-on threshold reached
+EOF
+}
+
+log() { printf '[audit] %s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        all|host|docker|vulns|images) STEPS+=("$1") ;;
+        --images) IMAGES_MODE=${2:?}; shift ;;
+        --max-images) MAX_IMAGES=${2:?}; shift ;;
+        --docker-socket) DOCKER_SOCK=${2:?}; shift ;;
+        --json) STDOUT_FORMAT=json ;;
+        --fail-on) FAIL_ON=${2:?}; shift ;;
+        --offline) OFFLINE=1 ;;
+        --version)
+            echo "debian-host-audit $VERSION (lynis $LYNIS_VERSION, docker-bench-security $DOCKER_BENCH_VERSION, trivy $TRIVY_VERSION)"
+            exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; die "unknown argument: $1" ;;
+    esac
+    shift
+done
+[ ${#STEPS[@]} -eq 0 ] && STEPS=(all)
+case "$IMAGES_MODE" in running|all|none) ;; *) die "--images must be running|all|none" ;; esac
+DOCKER_SOCK=${DOCKER_SOCK:-$HOST_ROOT/run/docker.sock}
+
+want() {
+    local s
+    for s in "${STEPS[@]}"; do [ "$s" = all ] || [ "$s" = "$1" ] && return 0; done
+    return 1
+}
+
+# ---------------------------------------------------------------- preflight
+[ -r "$HOST_ROOT/etc/os-release" ] || die "host root not mounted: add -v /:/host:ro"
+[ "$$" -ne 1 ] || die "not in the host PID namespace: add --pid=host"
+nsenter -t 1 -m -u -i -n -p -- true 2>/dev/null || die "cannot enter host namespaces: add --privileged"
+
+host_ns() {
+    nsenter -t 1 -m -u -i -n -p -- env -i \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        LC_ALL=C HOME=/root TERM=dumb "$@"
+}
+
+HOSTNAME_HOST=$(host_ns hostname 2>/dev/null || cat "$HOST_ROOT/etc/hostname")
+# shellcheck disable=SC1091
+OS_HOST=$(. "$HOST_ROOT/etc/os-release" 2>/dev/null; echo "${PRETTY_NAME:-unknown}")
+case "$OS_HOST" in *"Debian"*13*|*trixie*) ;; *) log "WARNING: built for Debian 13, host is '$OS_HOST' — results may be incomplete" ;; esac
+
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+OUT="$REPORTS_DIR/${HOSTNAME_HOST}_${STAMP}"
+RAW="$OUT/raw"
+mkdir -p "$RAW/host" "$RAW/coverage" "$RAW/images" || die "cannot create $OUT"
+mountpoint -q "$REPORTS_DIR" 2>/dev/null || log "NOTE: $REPORTS_DIR is not a volume — raw files are lost when the container exits (stdout still carries the summary)"
+START_ALL=$(date +%s)
+
+# coverage <check> <ok|partial|failed|skipped> <reason> <start-epoch>
+coverage() {
+    jq -n --arg check "$1" --arg status "$2" --arg reason "$3" \
+          --argjson duration "$(( $(date +%s) - $4 ))" \
+          '{check:$check, status:$status, reason:$reason, duration_s:$duration}' \
+          >"$RAW/coverage/$1.json"
+    log "$1: $2${3:+ — $3}"
+}
+
+# ---------------------------------------------------------------- steps
+step_lynis() {
+    local t0; t0=$(date +%s)
+    log "lynis: running system audit (1-3 min)"
+    host_ns sh -c 'cd "$1" && ./lynis audit system --no-colors --quick --auditor debian-host-audit \
+                     --logfile "$2" --report-file "$3"' _ \
+        "$SELF_ROOT/opt/lynis" "$SELF_ROOT$RAW/lynis.log" "$SELF_ROOT$RAW/lynis-report.dat" \
+        >"$RAW/lynis.txt" 2>&1
+    if [ -s "$RAW/lynis-report.dat" ]; then
+        coverage lynis ok "" "$t0"
+    else
+        coverage lynis failed "no report produced, see raw/lynis.txt" "$t0"
+    fi
+}
+
+step_collect() {
+    local t0; t0=$(date +%s)
+    log "custom: collecting host state"
+    if host_ns sh "$SELF_ROOT/opt/dha/lib/collect-host.sh" "$SELF_ROOT$RAW/host" >"$RAW/host/_collector.txt" 2>&1; then
+        coverage custom ok "" "$t0"
+    else
+        coverage custom failed "collector error, see raw/host/_collector.txt" "$t0"
+    fi
+}
+
+step_docker_bench() {
+    local t0; t0=$(date +%s)
+    if ! host_ns sh -c 'command -v docker >/dev/null && docker info >/dev/null 2>&1'; then
+        coverage docker-bench skipped "Docker not installed or daemon not reachable on the host" "$t0"
+        return
+    fi
+    log "docker-bench: running CIS Docker benchmark (1-5 min)"
+    host_ns sh -c 'cd "$1" && bash ./docker-bench-security.sh -b -l "$2"' _ \
+        "$SELF_ROOT/opt/docker-bench" "$SELF_ROOT$RAW/docker-bench.log" \
+        >"$RAW/docker-bench.txt" 2>&1
+    if [ -s "$RAW/docker-bench.log" ]; then
+        coverage docker-bench ok "" "$t0"
+    else
+        coverage docker-bench failed "no log produced, see raw/docker-bench.txt" "$t0"
+    fi
+}
+
+trivy_db_flags() {
+    if [ "$OFFLINE" = 1 ]; then echo "--skip-db-update --skip-java-db-update --offline-scan"; fi
+}
+
+# Copy a host file, resolving symlinks against HOST_ROOT (an absolute symlink
+# must not silently resolve inside the container, which is ALSO Debian 13).
+host_copy() {
+    local p=$1 dst=$2 t
+    for _ in 1 2 3 4 5 6 7 8; do
+        [ -L "$HOST_ROOT$p" ] || break
+        t=$(readlink "$HOST_ROOT$p")
+        case "$t" in /*) p=$t ;; *) p="$(dirname "$p")/$t" ;; esac
+    done
+    [ -f "$HOST_ROOT$p" ] && mkdir -p "$(dirname "$dst")" && cat "$HOST_ROOT$p" >"$dst"
+}
+
+step_vulns() {
+    local t0; t0=$(date +%s)
+    local osroot=/tmp/osroot
+    rm -rf "$osroot"; mkdir -p "$osroot"
+    host_copy /etc/os-release      "$osroot/etc/os-release"
+    host_copy /etc/debian_version  "$osroot/etc/debian_version"
+    if ! host_copy /var/lib/dpkg/status "$osroot/var/lib/dpkg/status"; then
+        coverage trivy-host failed "no dpkg status on host" "$t0"; return
+    fi
+    log "trivy: scanning host Debian packages"
+    # shellcheck disable=SC2046
+    if trivy rootfs --quiet --scanners vuln --pkg-types os $(trivy_db_flags) \
+            --format json --output "$RAW/trivy-host.json" "$osroot" >"$RAW/trivy-host.txt" 2>&1; then
+        coverage trivy-host ok "" "$t0"
+    else
+        coverage trivy-host failed "trivy error (DB download?), see raw/trivy-host.txt" "$t0"
+    fi
+}
+
+docker_api() { curl -fsS --unix-socket "$DOCKER_SOCK" "http://localhost/v1.41$1"; }
+
+step_images() {
+    local t0; t0=$(date +%s)
+    if [ "$IMAGES_MODE" = none ]; then coverage trivy-images skipped "--images none" "$t0"; return; fi
+    if [ ! -S "$DOCKER_SOCK" ] || ! docker_api /_ping >/dev/null 2>&1; then
+        coverage trivy-images skipped "no Docker socket at $DOCKER_SOCK" "$t0"; return
+    fi
+    local list
+    if [ "$IMAGES_MODE" = running ]; then
+        list=$(docker_api /containers/json | jq -r '[.[] | {id: .ImageID, c: (.Names[0] | ltrimstr("/"))}]
+               | group_by(.id) | .[] | [.[0].id, (map(.c) | join(","))] | @tsv')
+    else
+        list=$(docker_api /images/json | jq -r '.[] | [.Id, ""] | @tsv')
+    fi
+    local n=0 failed=0 total id containers ref safe
+    total=$(grep -c . <<<"$list")
+    : >"$RAW/images/index.tsv"
+    while IFS=$'\t' read -r id containers; do
+        [ -n "$id" ] || continue
+        [ "$MAX_IMAGES" -gt 0 ] && [ "$n" -ge "$MAX_IMAGES" ] && break
+        ref=$(docker_api "/images/$id/json" | jq -r '(.RepoTags // [])[0] // .Id')
+        safe=$(printf '%s' "${id#sha256:}" | cut -c1-12)
+        printf '%s\t%s\t%s\n' "$safe" "$ref" "$containers" >>"$RAW/images/index.tsv"
+        n=$((n + 1))
+        log "trivy: image $n/$total — $ref"
+        # shellcheck disable=SC2046
+        trivy image --quiet --image-src docker --docker-host "unix://$DOCKER_SOCK" \
+              --scanners vuln --timeout 20m $(trivy_db_flags) \
+              --format json --output "$RAW/images/$safe.json" "$id" \
+              >"$RAW/images/$safe.txt" 2>&1 || failed=$((failed + 1))
+    done <<<"$list"
+    if [ "$n" -eq 0 ]; then
+        coverage trivy-images skipped "no image to scan (mode: $IMAGES_MODE)" "$t0"
+    elif [ "$failed" -gt 0 ]; then
+        coverage trivy-images failed "$failed/$n image scans failed, see raw/images/*.txt" "$t0"
+    elif [ "$n" -lt "$total" ]; then
+        coverage trivy-images partial "$n of $total images scanned (--max-images)" "$t0"
+    else
+        coverage trivy-images ok "$n images scanned" "$t0"
+    fi
+}
+
+want host   && { step_lynis; step_collect; }
+want docker && step_docker_bench
+want vulns  && step_vulns
+want images && step_images
+
+# ---------------------------------------------------------------- report
+jq -n --arg tool_version "$VERSION" --arg lynis "$LYNIS_VERSION" --arg bench "$DOCKER_BENCH_VERSION" \
+      --arg trivy "$TRIVY_VERSION" --arg hostname "$HOSTNAME_HOST" --arg os "$OS_HOST" \
+      --arg stamp "$STAMP" --argjson duration "$(( $(date +%s) - START_ALL ))" \
+      --arg steps "${STEPS[*]}" --arg images_mode "$IMAGES_MODE" \
+      '{tool_version:$tool_version, components:{lynis:$lynis, "docker-bench-security":$bench, trivy:$trivy},
+        hostname:$hostname, os:$os, audited_at:$stamp, duration_s:$duration,
+        steps:($steps|split(" ")), images_mode:$images_mode}' >"$RAW/run.json"
+
+python3 /opt/dha/lib/summarize.py "$OUT" || die "summary generation failed (raw files kept in $OUT/raw)"
+# Hand the report to whoever owns the mounted reports directory. Owner-only:
+# a security posture report is sensitive.
+chown -R "$(stat -c %u:%g "$REPORTS_DIR")" "$OUT" 2>/dev/null || true
+chmod -R u+rwX,go-rwx "$OUT" 2>/dev/null || true
+log "report: $OUT/summary.md and $OUT/summary.json"
+
+if [ "$STDOUT_FORMAT" = json ]; then cat "$OUT/summary.json"; else cat "$OUT/summary.md"; fi
+
+if [ -n "$FAIL_ON" ]; then
+    python3 /opt/dha/lib/summarize.py --check-threshold "$FAIL_ON" "$OUT/summary.json" || exit 2
+fi
+exit 0
