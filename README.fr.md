@@ -30,13 +30,13 @@ docker run --rm --privileged --pid=host \
   ghcr.io/aurelienfeignon/debian-host-audit:0.1
 ```
 
-Étiquettes : `0.1.1` (exacte), `0.1` (dernier correctif), `latest`. Pour un outil qui tourne en root, mieux vaut épingler l'empreinte affichée par `docker pull` : `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Les images sont en linux/amd64, avec un SBOM et une attestation de provenance signée.
+Étiquettes : `0.1.2` (exacte), `0.1` (dernier correctif), `latest`. Pour un outil qui tourne en root, mieux vaut épingler l'empreinte affichée par `docker pull` : `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Les images sont en linux/amd64, avec un SBOM et une attestation de provenance signée.
 
 Ou la construire soi-même :
 
 ```bash
 git clone https://github.com/aurelienFeignon/debian-host-audit && cd debian-host-audit
-docker build -t debian-host-audit:0.1.1 .
+docker build -t debian-host-audit:0.1.2 .
 ```
 
 `summary.md` s'affiche sur la sortie standard. Tout est écrit dans `reports/<hostname>_<horodatage UTC>/`, sous l'identité du propriétaire de `reports/` (pas en root), et lisible par lui seul.
@@ -44,7 +44,7 @@ docker build -t debian-host-audit:0.1.1 .
 **Pour un agent**, demander le JSON sur la sortie standard (les journaux partent sur la sortie d'erreur) :
 
 ```bash
-docker run --rm --privileged --pid=host -v /:/host:ro debian-host-audit:0.1.1 --json > audit.json
+docker run --rm --privileged --pid=host -v /:/host:ro debian-host-audit:0.1.2 --json > audit.json
 jq '.coverage_complete, .counts, [.findings[] | select(.severity=="critical" or .severity=="high")]' audit.json
 ```
 
@@ -121,7 +121,7 @@ scripts/audit-remote.sh vm1 vm2 admin@vm3 -- all --max-images 20
 scripts/audit-remote.sh --ship-image vm1 vm2
 ```
 
-Les fichiers bruts restent sur chaque hôte, dans `~/host-audit-reports/`. Ajouter `--sudo` si l'utilisateur SSH n'est pas dans le groupe `docker` ; il faut alors un sudo sans mot de passe, puisque ssh tourne sans tty. Un hôte en échec n'arrête jamais les autres. Code de sortie : `0` tous les rapports produits, `2` tous produits et au moins un a atteint `--fail-on`, `1` au moins un hôte en échec.
+L'image par défaut est retéléchargée à chaque passage : un hôte n'audite jamais avec le correctif plus ancien tiré la fois précédente, et la ligne de synthèse affiche la version de l'outil réellement exécutée. Un `IMAGE=` explicite ou `--ship-image` s'emploie tel qu'il se trouve sur l'hôte. Les fichiers bruts restent sur chaque hôte, dans `~/host-audit-reports/`. Ajouter `--sudo` si l'utilisateur SSH n'est pas dans le groupe `docker` ; il faut alors un sudo sans mot de passe, puisque ssh tourne sans tty. Un hôte en échec n'arrête jamais les autres. Code de sortie : `0` tous les rapports produits, `2` tous produits et au moins un a atteint `--fail-on`, `1` au moins un hôte en échec.
 
 ## Sécurité
 
@@ -165,7 +165,7 @@ shellcheck -S warning bin/audit lib/collect-host.sh scripts/audit-remote.sh buil
 
 Pour monter un composant de version, changer `*_VERSION` et `*_SHA256` dans le `Dockerfile` dans le même commit.
 
-La CI (`.github/workflows/ci.yml`) lance les tests unitaires et shellcheck, construit l'image, puis **audite le runner GitHub lui-même**. Elle échoue si le témoin, ou l'un des contrôles Lynis, maison, docker-bench ou trivy-host, n'est pas `ok`. Pour publier une version : monter `VERSION`, faire le commit, puis pousser l'étiquette correspondante (`git tag v0.1.1 && git push origin v0.1.1`). Si l'étiquette ne correspond pas à `VERSION`, la publication échoue.
+La CI (`.github/workflows/ci.yml`) lance les tests unitaires et shellcheck, construit l'image, puis **audite le runner GitHub lui-même**. Elle échoue si le témoin, ou l'un des contrôles Lynis, maison, docker-bench ou trivy-host, n'est pas `ok`. Pour publier une version : monter `VERSION`, faire le commit, puis pousser l'étiquette correspondante (`git tag v0.1.2 && git push origin v0.1.2`). Si l'étiquette ne correspond pas à `VERSION`, la publication échoue.
 
 ## Licence
 

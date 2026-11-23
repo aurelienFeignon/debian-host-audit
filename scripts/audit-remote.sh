@@ -10,6 +10,10 @@
 #   IMAGE=...      env: image to run (default: ghcr.io/aurelienfeignon/debian-host-audit:<major.minor>,
 #                  or the local debian-host-audit:<VERSION> with --ship-image)
 #
+# The default registry image is pulled on every run (`--pull always`): a host keeps the
+# `:<major.minor>` it pulled last time, and `docker run` would silently audit with that
+# older patch release. An explicit IMAGE= or --ship-image is used as found on the host.
+#
 # Raw files stay on each host under ~/host-audit-reports/ (owner-only).
 # One host failing never stops the others. Exit status: 0 all reports produced,
 # 2 all produced and at least one reached --fail-on, 1 at least one host failed.
@@ -37,8 +41,9 @@ while [ $# -gt 0 ]; do
 done
 [ ${#HOSTS[@]} -gt 0 ] || { echo "no host given" >&2; exit 1; }
 # Default image: the published one, or the local build when shipping it.
+PULL=missing
 if [ "$SHIP" = 1 ]; then IMAGE=${IMAGE:-debian-host-audit:$VERSION}
-else IMAGE=${IMAGE:-ghcr.io/aurelienfeignon/debian-host-audit:${VERSION%.*}}; fi
+elif [ -z "${IMAGE:-}" ]; then IMAGE=ghcr.io/aurelienfeignon/debian-host-audit:${VERSION%.*}; PULL=always; fi
 mkdir -p "$OUT"  # new dirs come out 700 from the umask; an existing --out keeps its mode
 
 failed=0
@@ -52,7 +57,7 @@ for h in "${HOSTS[@]}"; do
     install -m 600 /dev/null "$OUT/$h.json"  # a report left by 0.1.0 may be 664
     # shellcheck disable=SC2029  # AUDIT_ARGS are expanded locally on purpose
     ssh "$h" "mkdir -p ~/host-audit-reports && chmod 700 ~/host-audit-reports && \
-        $SUDO docker run --rm --privileged --pid=host -v /:/host:ro \
+        $SUDO docker run --pull $PULL --rm --privileged --pid=host -v /:/host:ro \
         -v ~/host-audit-reports:/reports $IMAGE ${AUDIT_ARGS[*]} --json" >"$OUT/$h.json"
     rc=$?
     # 0 = report, 2 = report + --fail-on threshold reached; anything else = no usable report
@@ -63,7 +68,7 @@ for h in "${HOSTS[@]}"; do
     [ "$rc" -eq 2 ] && threshold=$((threshold + 1))
     python3 -c "
 import json,sys; s=json.load(open(sys.argv[1]))
-print(f\"{s['run']['hostname']}: \" + ', '.join(f'{n} {k}' for k,n in s['counts'].items()) +
+print(f\"{s['run']['hostname']} (tool {s['run'].get('tool_version', '?')}): \" + ', '.join(f'{n} {k}' for k,n in s['counts'].items()) +
       ('' if s['coverage_complete'] else '  ⚠ coverage incomplete') +
       ('  ⛔ --fail-on threshold reached' if sys.argv[2] == '2' else ''))" "$OUT/$h.json" "$rc" >&2 \
         || { echo "!! $h: unreadable report $OUT/$h.json" >&2; failed=$((failed + 1)); }

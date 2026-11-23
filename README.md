@@ -30,13 +30,13 @@ docker run --rm --privileged --pid=host \
   ghcr.io/aurelienfeignon/debian-host-audit:0.1
 ```
 
-Tags: `0.1.1` (exact), `0.1` (latest patch), `latest`. For a tool that runs as root, prefer pinning the digest printed by `docker pull`: `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Images are linux/amd64, with an SBOM and a signed build provenance attestation.
+Tags: `0.1.2` (exact), `0.1` (latest patch), `latest`. For a tool that runs as root, prefer pinning the digest printed by `docker pull`: `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Images are linux/amd64, with an SBOM and a signed build provenance attestation.
 
 Or build it yourself:
 
 ```bash
 git clone https://github.com/aurelienFeignon/debian-host-audit && cd debian-host-audit
-docker build -t debian-host-audit:0.1.1 .
+docker build -t debian-host-audit:0.1.2 .
 ```
 
 `summary.md` is printed on stdout. Everything lands in `reports/<hostname>_<UTC timestamp>/`. It is written with the identity of whoever owns `reports/` (not as root) and is readable by that owner only.
@@ -44,7 +44,7 @@ docker build -t debian-host-audit:0.1.1 .
 **For an agent**, ask for JSON on stdout (logs go to stderr):
 
 ```bash
-docker run --rm --privileged --pid=host -v /:/host:ro debian-host-audit:0.1.1 --json > audit.json
+docker run --rm --privileged --pid=host -v /:/host:ro debian-host-audit:0.1.2 --json > audit.json
 jq '.coverage_complete, .counts, [.findings[] | select(.severity=="critical" or .severity=="high")]' audit.json
 ```
 
@@ -121,7 +121,7 @@ scripts/audit-remote.sh vm1 vm2 admin@vm3 -- all --max-images 20
 scripts/audit-remote.sh --ship-image vm1 vm2
 ```
 
-Raw files stay on each host under `~/host-audit-reports/`. Use `--sudo` if the SSH user is not in the `docker` group; it needs passwordless sudo, since ssh runs without a tty. A host that fails never stops the others. Exit status: `0` all reports produced, `2` all produced and at least one reached `--fail-on`, `1` at least one host failed.
+The default image is pulled on every run, so a host never audits with the older patch release it pulled last time; the summary line prints the tool version that actually ran. An explicit `IMAGE=` or `--ship-image` is used as found on the host. Raw files stay on each host under `~/host-audit-reports/`. Use `--sudo` if the SSH user is not in the `docker` group; it needs passwordless sudo, since ssh runs without a tty. A host that fails never stops the others. Exit status: `0` all reports produced, `2` all produced and at least one reached `--fail-on`, `1` at least one host failed.
 
 ## Security considerations
 
@@ -165,7 +165,7 @@ shellcheck -S warning bin/audit lib/collect-host.sh scripts/audit-remote.sh buil
 
 To bump a component, change both `*_VERSION` and `*_SHA256` in the `Dockerfile` in the same commit.
 
-CI (`.github/workflows/ci.yml`) runs the unit tests, shellcheck, builds the image, and **audits the GitHub runner itself**, failing if the witness or any of Lynis / custom / docker-bench / trivy-host is not `ok`. To release, bump `VERSION`, commit, and push a matching tag (`git tag v0.1.1 && git push origin v0.1.1`). The tag must match `VERSION`, or the release fails.
+CI (`.github/workflows/ci.yml`) runs the unit tests, shellcheck, builds the image, and **audits the GitHub runner itself**, failing if the witness or any of Lynis / custom / docker-bench / trivy-host is not `ok`. To release, bump `VERSION`, commit, and push a matching tag (`git tag v0.1.2 && git push origin v0.1.2`). The tag must match `VERSION`, or the release fails.
 
 ## License
 
