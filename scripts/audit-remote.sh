@@ -50,8 +50,8 @@ for h in "${HOSTS[@]}"; do
         echo "!! $h: could not ship the image, skipped" >&2
         failed=$((failed + 1)); continue
     fi
-    # shellcheck disable=SC2029  # AUDIT_ARGS are expanded locally on purpose
     install -m 600 /dev/null "$OUT/$h.json"
+    # shellcheck disable=SC2029  # AUDIT_ARGS are expanded locally on purpose
     ssh "$h" "mkdir -p ~/host-audit-reports && chmod 700 ~/host-audit-reports && \
         $SUDO docker run --rm --privileged --pid=host -v /:/host:ro \
         -v ~/host-audit-reports:/reports $IMAGE ${AUDIT_ARGS[*]} --json" >"$OUT/$h.json"
