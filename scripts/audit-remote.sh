@@ -7,7 +7,7 @@
 #   --sudo         run docker through sudo on the remote host
 #   --out DIR      where to write <host>.json locally (default: ./reports)
 #   -- ARGS        passed to the audit command (default: all)
-#   IMAGE=...      env: image to run (default: ghcr.io/aurelienfeignon/debian-host-audit:<VERSION>,
+#   IMAGE=...      env: image to run (default: ghcr.io/aurelienfeignon/debian-host-audit:<major.minor>,
 #                  or the local debian-host-audit:<VERSION> with --ship-image)
 #
 # Raw files stay on each host under ~/host-audit-reports/ (owner-only).
@@ -38,8 +38,9 @@ done
 [ ${#HOSTS[@]} -gt 0 ] || { echo "no host given" >&2; exit 1; }
 # Default image: the published one, or the local build when shipping it.
 if [ "$SHIP" = 1 ]; then IMAGE=${IMAGE:-debian-host-audit:$VERSION}
-else IMAGE=${IMAGE:-ghcr.io/aurelienfeignon/debian-host-audit:$VERSION}; fi
-mkdir -p "$OUT"
+else IMAGE=${IMAGE:-ghcr.io/aurelienfeignon/debian-host-audit:${VERSION%.*}}; fi
+# umask does not reach a directory or report left by an earlier run.
+mkdir -p "$OUT" && chmod 700 "$OUT"
 
 failed=0
 threshold=0
@@ -50,6 +51,7 @@ for h in "${HOSTS[@]}"; do
         failed=$((failed + 1)); continue
     fi
     # shellcheck disable=SC2029  # AUDIT_ARGS are expanded locally on purpose
+    install -m 600 /dev/null "$OUT/$h.json"
     ssh "$h" "mkdir -p ~/host-audit-reports && chmod 700 ~/host-audit-reports && \
         $SUDO docker run --rm --privileged --pid=host -v /:/host:ro \
         -v ~/host-audit-reports:/reports $IMAGE ${AUDIT_ARGS[*]} --json" >"$OUT/$h.json"

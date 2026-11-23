@@ -1,7 +1,9 @@
 # debian-host-audit — one image, one command, one report.
 #
 # Every third-party component is pinned by version AND sha256. Bumping a
-# version means updating both values in the same commit.
+# version means updating both values in the same commit. Exception: Debian
+# packages are upgraded at build time, so security fixes land before the base
+# image is rebuilt; two builds of one commit may differ in those packages.
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
@@ -15,8 +17,7 @@ ARG TRIVY_SHA256=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdb
 # Set to 1 to bake the Trivy vulnerability DB into the image (offline hosts, ~+100 MB).
 ARG EMBED_TRIVY_DB=0
 
-# upgrade: the pinned base lags behind stable-security (zlib1g, libssl3t64 in 0.1.0).
-RUN apt-get update \
+RUN export DEBIAN_FRONTEND=noninteractive && apt-get update \
  && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates curl jq python3 \
  && rm -rf /var/lib/apt/lists/*

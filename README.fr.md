@@ -30,13 +30,13 @@ docker run --rm --privileged --pid=host \
   ghcr.io/aurelienfeignon/debian-host-audit:0.1
 ```
 
-Étiquettes : `0.1.0` (exacte), `0.1` (dernier correctif), `latest`. Pour un outil qui tourne en root, mieux vaut épingler l'empreinte affichée par `docker pull` : `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Les images sont en linux/amd64, avec un SBOM et une attestation de provenance signée.
+Étiquettes : `0.1.1` (exacte), `0.1` (dernier correctif), `latest`. Pour un outil qui tourne en root, mieux vaut épingler l'empreinte affichée par `docker pull` : `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Les images sont en linux/amd64, avec un SBOM et une attestation de provenance signée.
 
 Ou la construire soi-même :
 
 ```bash
 git clone https://github.com/aurelienFeignon/debian-host-audit && cd debian-host-audit
-docker build -t debian-host-audit:0.1.0 .
+docker build -t debian-host-audit:0.1.1 .
 ```
 
 `summary.md` s'affiche sur la sortie standard. Tout est écrit dans `reports/<hostname>_<horodatage UTC>/`, sous l'identité du propriétaire de `reports/` (pas en root), et lisible par lui seul.
@@ -44,7 +44,7 @@ docker build -t debian-host-audit:0.1.0 .
 **Pour un agent**, demander le JSON sur la sortie standard (les journaux partent sur la sortie d'erreur) :
 
 ```bash
-docker run --rm --privileged --pid=host -v /:/host:ro debian-host-audit:0.1.0 --json > audit.json
+docker run --rm --privileged --pid=host -v /:/host:ro debian-host-audit:0.1.1 --json > audit.json
 jq '.coverage_complete, .counts, [.findings[] | select(.severity=="critical" or .severity=="high")]' audit.json
 ```
 
@@ -62,7 +62,7 @@ debian-host-audit [ÉTAPE...] [OPTIONS]
   images    scan Trivy des images de conteneurs
 
 Options
-  --images running|all|none   images à scanner (par défaut : celles des conteneurs en marche)
+  --images running|all|none   images à scanner (par défaut : celles des conteneurs en marche ; l'image de l'audit elle-même est écartée)
   --max-images N              au plus N images (la couverture indique alors "partial")
   --docker-socket CHEMIN      par défaut : /host/run/docker.sock
   --json                      summary.json sur la sortie standard au lieu de summary.md
@@ -113,8 +113,9 @@ Les vérifications préalables refusent de lancer l'audit sans `-v /:/host:ro`, 
 ## Auditer plusieurs VM
 
 ```bash
-# chaque hôte tire l'image de GHCR et l'exécute ; <hôte>.json est rapatrié en local
-IMAGE=ghcr.io/aurelienfeignon/debian-host-audit:0.1 scripts/audit-remote.sh vm1 vm2 admin@vm3 -- all --max-images 20
+# chaque hôte tire ghcr.io/…/debian-host-audit:<majeure.mineure de VERSION> (IMAGE= pour une autre),
+# l'exécute ; <hôte>.json est rapatrié en local, lisible du seul propriétaire
+scripts/audit-remote.sh vm1 vm2 admin@vm3 -- all --max-images 20
 
 # ou, avec une image construite en local et des hôtes sans accès au registre
 scripts/audit-remote.sh --ship-image vm1 vm2
