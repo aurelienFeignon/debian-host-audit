@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
         --sudo) SUDO=sudo ;;
         --out) OUT=${2:?}; shift ;;
         --) shift; AUDIT_ARGS=("$@"); break ;;
-        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
         *) HOSTS+=("$1") ;;
     esac
     shift
@@ -39,8 +39,7 @@ done
 # Default image: the published one, or the local build when shipping it.
 if [ "$SHIP" = 1 ]; then IMAGE=${IMAGE:-debian-host-audit:$VERSION}
 else IMAGE=${IMAGE:-ghcr.io/aurelienfeignon/debian-host-audit:${VERSION%.*}}; fi
-# umask does not reach a directory or report left by an earlier run.
-mkdir -p "$OUT" && chmod 700 "$OUT"
+mkdir -p "$OUT"  # new dirs come out 700 from the umask; an existing --out keeps its mode
 
 failed=0
 threshold=0
@@ -50,7 +49,7 @@ for h in "${HOSTS[@]}"; do
         echo "!! $h: could not ship the image, skipped" >&2
         failed=$((failed + 1)); continue
     fi
-    install -m 600 /dev/null "$OUT/$h.json"
+    install -m 600 /dev/null "$OUT/$h.json"  # a report left by 0.1.0 may be 664
     # shellcheck disable=SC2029  # AUDIT_ARGS are expanded locally on purpose
     ssh "$h" "mkdir -p ~/host-audit-reports && chmod 700 ~/host-audit-reports && \
         $SUDO docker run --rm --privileged --pid=host -v /:/host:ro \
