@@ -223,22 +223,15 @@ step_images() {
     if [ ! -S "$DOCKER_SOCK" ] || ! docker_api /_ping >/dev/null 2>&1; then
         coverage trivy-images skipped "no Docker socket at $DOCKER_SOCK" "$t0"; return
     fi
-    # Skip this audit's own container and image: they are the tool, not the host.
-    # Our id is in the source of the /etc/hostname bind (field 5 = mount point);
-    # other containers' paths can appear elsewhere in mountinfo through /host.
-    local list self self_img note=""
-    self=$(awk '$5 == "/etc/hostname"' /proc/self/mountinfo | grep -oE '/containers/[0-9a-f]{64}/' | head -n1 | cut -d/ -f3)
-    self_img=$( [ -n "$self" ] && docker_api "/containers/$self/json" | jq -r '.Image // empty' )
-    if [ -z "$self_img" ]; then
-        note="; own container not identified, the audit image may be included"
-        log "trivy: own container not identified, the audit image may be scanned too"
-    fi
+    # Skip the audit tool itself, any version: its image label (Dockerfile LABEL,
+    # inherited by its containers) marks it, whatever the container runtime.
+    local list not_us='(.Labels // {})["org.opencontainers.image.title"] != "debian-host-audit"'
     if [ "$IMAGES_MODE" = running ]; then
-        list=$(docker_api /containers/json | jq -r --arg self "$self" '[.[] | select(.Id != $self)
-               | {id: .ImageID, c: (.Names[0] | ltrimstr("/"))}]
-               | group_by(.id) | .[] | [.[0].id, (map(.c) | join(","))] | @tsv')
+        list=$(docker_api /containers/json | jq -r "[.[] | select($not_us)
+               | {id: .ImageID, c: (.Names[0] | ltrimstr(\"/\"))}]
+               | group_by(.id) | .[] | [.[0].id, (map(.c) | join(\",\"))] | @tsv")
     else
-        list=$(docker_api /images/json | jq -r --arg img "$self_img" '.[] | select(.Id != $img) | [.Id, ""] | @tsv')
+        list=$(docker_api /images/json | jq -r ".[] | select($not_us) | [.Id, \"\"] | @tsv")
     fi
     local n=0 failed=0 total id containers ref safe
     total=$(grep -c . <<<"$list")
@@ -258,13 +251,13 @@ step_images() {
               >"$RAW/images/$safe.txt" 2>&1 || failed=$((failed + 1))
     done <<<"$list"
     if [ "$n" -eq 0 ]; then
-        coverage trivy-images skipped "no image to scan (mode: $IMAGES_MODE)$note" "$t0"
+        coverage trivy-images skipped "no image to scan (mode: $IMAGES_MODE)" "$t0"
     elif [ "$failed" -gt 0 ]; then
-        coverage trivy-images failed "$failed/$n image scans failed, see raw/images/*.txt$note" "$t0"
+        coverage trivy-images failed "$failed/$n image scans failed, see raw/images/*.txt" "$t0"
     elif [ "$n" -lt "$total" ]; then
-        coverage trivy-images partial "$n of $total images scanned (--max-images)$note" "$t0"
+        coverage trivy-images partial "$n of $total images scanned (--max-images)" "$t0"
     else
-        coverage trivy-images ok "$n images scanned$note" "$t0"
+        coverage trivy-images ok "$n images scanned" "$t0"
     fi
 }
 
