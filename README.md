@@ -30,13 +30,13 @@ docker run --rm --privileged --pid=host \
   ghcr.io/aurelienfeignon/debian-host-audit:0.1
 ```
 
-Tags: `0.1.0` (exact), `0.1` (latest patch), `latest`. For a tool that runs as root, prefer pinning the digest printed by `docker pull`: `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Images are linux/amd64, with an SBOM and a signed build provenance attestation.
+Tags: `0.1.1` (exact), `0.1` (latest patch), `latest`. For a tool that runs as root, prefer pinning the digest printed by `docker pull`: `ghcr.io/aurelienfeignon/debian-host-audit@sha256:…`. Images are linux/amd64, with an SBOM and a signed build provenance attestation.
 
 Or build it yourself:
 
 ```bash
 git clone https://github.com/aurelienFeignon/debian-host-audit && cd debian-host-audit
-docker build -t debian-host-audit:0.1.0 .
+docker build -t debian-host-audit:0.1.1 .
 ```
 
 `summary.md` is printed on stdout. Everything lands in `reports/<hostname>_<UTC timestamp>/`. It is written with the identity of whoever owns `reports/` (not as root) and is readable by that owner only.
@@ -44,7 +44,7 @@ docker build -t debian-host-audit:0.1.0 .
 **For an agent**, ask for JSON on stdout (logs go to stderr):
 
 ```bash
-docker run --rm --privileged --pid=host -v /:/host:ro debian-host-audit:0.1.0 --json > audit.json
+docker run --rm --privileged --pid=host -v /:/host:ro debian-host-audit:0.1.1 --json > audit.json
 jq '.coverage_complete, .counts, [.findings[] | select(.severity=="critical" or .severity=="high")]' audit.json
 ```
 
@@ -62,7 +62,7 @@ Steps (default: all)
   images    Trivy scan of container images
 
 Options
-  --images running|all|none   which images to scan (default: those of running containers)
+  --images running|all|none   which images to scan (default: those of running containers; the audit's own image is skipped)
   --max-images N              scan at most N images (coverage then reads "partial")
   --docker-socket PATH        default: /host/run/docker.sock
   --json                      summary.json on stdout instead of summary.md
@@ -113,8 +113,9 @@ Preflight refuses to run without `-v /:/host:ro`, `--pid=host` or `--privileged`
 ## Auditing several VMs
 
 ```bash
-# each host pulls the image from GHCR, runs it; <host>.json is collected locally
-IMAGE=ghcr.io/aurelienfeignon/debian-host-audit:0.1 scripts/audit-remote.sh vm1 vm2 admin@vm3 -- all --max-images 20
+# each host pulls ghcr.io/…/debian-host-audit:<major.minor of VERSION> (override with IMAGE=),
+# runs it; <host>.json is collected locally, owner-only
+scripts/audit-remote.sh vm1 vm2 admin@vm3 -- all --max-images 20
 
 # or, with a locally built image and no registry access on the hosts
 scripts/audit-remote.sh --ship-image vm1 vm2
