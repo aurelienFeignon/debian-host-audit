@@ -7,14 +7,17 @@
 #   --sudo         run docker through sudo on the remote host
 #   --out DIR      where to write <host>.json locally (default: ./reports)
 #   -- ARGS        passed to the audit command (default: all)
+#   IMAGE=...      env: image to run (default: ghcr.io/aurelienfeignon/debian-host-audit:<VERSION>,
+#                  or the local debian-host-audit:<VERSION> with --ship-image)
 #
 # Raw files stay on each host under ~/host-audit-reports/ (owner-only).
 # One host failing never stops the others. Exit status: 0 all reports produced,
 # 2 all produced and at least one reached --fail-on, 1 at least one host failed.
 
 set -uo pipefail
+umask 077  # reports describe how to attack the host: owner-only
 
-IMAGE=${IMAGE:-debian-host-audit:$(cat "$(dirname "$0")/../VERSION")}
+VERSION=$(cat "$(dirname "$0")/../VERSION")
 SHIP=0
 SUDO=
 OUT=./reports
@@ -27,12 +30,15 @@ while [ $# -gt 0 ]; do
         --sudo) SUDO=sudo ;;
         --out) OUT=${2:?}; shift ;;
         --) shift; AUDIT_ARGS=("$@"); break ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
         *) HOSTS+=("$1") ;;
     esac
     shift
 done
 [ ${#HOSTS[@]} -gt 0 ] || { echo "no host given" >&2; exit 1; }
+# Default image: the published one, or the local build when shipping it.
+if [ "$SHIP" = 1 ]; then IMAGE=${IMAGE:-debian-host-audit:$VERSION}
+else IMAGE=${IMAGE:-ghcr.io/aurelienfeignon/debian-host-audit:$VERSION}; fi
 mkdir -p "$OUT"
 
 failed=0

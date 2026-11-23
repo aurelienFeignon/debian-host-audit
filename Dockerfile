@@ -15,7 +15,9 @@ ARG TRIVY_SHA256=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdb
 # Set to 1 to bake the Trivy vulnerability DB into the image (offline hosts, ~+100 MB).
 ARG EMBED_TRIVY_DB=0
 
+# upgrade: the pinned base lags behind stable-security (zlib1g, libssl3t64 in 0.1.0).
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates curl jq python3 \
  && rm -rf /var/lib/apt/lists/*
 

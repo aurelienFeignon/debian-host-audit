@@ -225,7 +225,12 @@ step_images() {
     fi
     local list
     if [ "$IMAGES_MODE" = running ]; then
-        list=$(docker_api /containers/json | jq -r '[.[] | {id: .ImageID, c: (.Names[0] | ltrimstr("/"))}]
+        # Skip this audit's own container: its image is the tool, not the host.
+        local self
+        self=$(grep -oE '/containers/[0-9a-f]{64}/' /proc/self/mountinfo | head -n1 | cut -d/ -f3)
+        [ -n "$self" ] || log "trivy: own container id not found, the audit image will be scanned too"
+        list=$(docker_api /containers/json | jq -r --arg self "$self" '[.[] | select(.Id != $self)
+               | {id: .ImageID, c: (.Names[0] | ltrimstr("/"))}]
                | group_by(.id) | .[] | [.[0].id, (map(.c) | join(","))] | @tsv')
     else
         list=$(docker_api /images/json | jq -r '.[] | [.Id, ""] | @tsv')
